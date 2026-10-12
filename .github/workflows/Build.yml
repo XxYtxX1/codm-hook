@@ -1,0 +1,395 @@
+name: Build CODM Stretch Hook
+on:
+  workflow_dispatch:
+  push:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Create project files
+        run: |
+          set -e
+          mkdir -p "$(dirname 'app/build.gradle')"
+          cat > 'app/build.gradle' <<'__EOF__'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.codmstretch.hook'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.codmstretch.hook'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+
+          dependencies {
+              // Xposed API classes are provided by LSPosed at runtime - never package them.
+              compileOnly project(':xposed-stub')
+          }
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="CODM Stretch Hook"
+                  android:allowBackup="false">
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data
+                      android:name="xposeddescription"
+                      android:value="Makes the screen fill the whole panel (stretch) instead of adding black bars when the display size uses a different aspect ratio. Pair with CODM Ultra Stretch." />
+                  <meta-data android:name="xposedminversion" android:value="93" />
+                  <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
+              </application>
+          </manifest>
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/assets/xposed_init')"
+          cat > 'app/src/main/assets/xposed_init' <<'__EOF__'
+          com.codmstretch.hook.StretchHook
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/java/com/codmstretch/hook/StretchHook.java')"
+          cat > 'app/src/main/java/com/codmstretch/hook/StretchHook.java' <<'__EOF__'
+          package com.codmstretch.hook;
+
+          import android.graphics.Rect;
+
+          import java.io.BufferedReader;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.FileReader;
+          import java.util.Set;
+
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.XposedHelpers;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+          /**
+           * Runs inside system_server (scope: System Framework).
+           *
+           * When the display size is overridden to a different aspect ratio ("wm size"), Android
+           * keeps the picture's shape and centers it with black bars. This hook replaces that
+           * centered "display rect" with the full panel, so SurfaceFlinger stretches the picture
+           * to fill the screen. Touch input follows because the input viewport is built from the
+           * same rect.
+           *
+           * It does nothing when there are no bars, when /data/system/codm_stretch_off exists,
+           * or for non-built-in displays. Status is written to /data/system/codm_stretch_hook.txt.
+           */
+          public class StretchHook implements IXposedHookLoadPackage {
+              private static final String STATUS_FILE = "/data/system/codm_stretch_hook.txt";
+              private static final String OFF_FILE = "/data/system/codm_stretch_off";
+              private static final String TARGET = "com.android.server.display.DisplayDevice";
+
+              private static volatile boolean hooked = false;
+              private static volatile String message = "starting";
+              private static volatile String last = "";
+              private static volatile int events = 0;
+              private static volatile long lastWrite = 0;
+              private static volatile String bootId = "";
+
+              @Override
+              public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) {
+                  if (lp == null || !"android".equals(lp.packageName)) return;
+                  try {
+                      bootId = firstLine("/proc/sys/kernel/random/boot_id");
+                      Class<?> cls = XposedHelpers.findClassIfExists(TARGET, lp.classLoader);
+                      if (cls == null) {
+                          message = "DisplayDevice class not found";
+                      } else {
+                          Set<?> set = XposedBridge.hookAllMethods(cls, "setProjectionLocked", new ProjectionHook());
+                          hooked = set != null && !set.isEmpty();
+                          message = hooked ? "hooked setProjectionLocked x" + set.size()
+                                           : "setProjectionLocked not found";
+                      }
+                  } catch (Throwable t) {
+                      message = "load error " + t.getClass().getSimpleName();
+                      XposedBridge.log(t);
+                  }
+                  writeStatus(true);
+              }
+
+              private static final class ProjectionHook extends XC_MethodHook {
+                  @Override
+                  protected void beforeHookedMethod(MethodHookParam param) {
+                      try {
+                          if (new File(OFF_FILE).exists()) return;
+                          Object[] a = param.args;
+                          int first = -1;
+                          int second = -1;
+                          for (int i = 0; i < a.length; i++) {
+                              if (a[i] instanceof Rect) {
+                                  if (first < 0) {
+                                      first = i;
+                                  } else if (second < 0) {
+                                      second = i;
+                                  }
+                              }
+                          }
+                          // args: (transaction, orientation, layerStackRect, displayRect)
+                          if (second < 0) return;
+                          if (!isInternal(param.thisObject)) return;
+
+                          Rect disp = (Rect) a[second];
+                          int left = disp.left;
+                          int top = disp.top;
+                          if (left <= 0 && top <= 0) return; // already fills the panel
+
+                          // The bars are centered, so the full panel is the rect plus the offsets.
+                          Rect full = new Rect(0, 0, disp.right + left, disp.bottom + top);
+                          a[second] = full;
+
+                          events++;
+                          last = "from " + disp.toShortString() + " to " + full.toShortString();
+                          writeStatus(false);
+                      } catch (Throwable t) {
+                          message = "hook error " + t.getClass().getSimpleName();
+                          writeStatus(false);
+                      }
+                  }
+              }
+
+              private static boolean isInternal(Object device) {
+                  try {
+                      Object info = XposedHelpers.callMethod(device, "getDisplayDeviceInfoLocked");
+                      return XposedHelpers.getIntField(info, "type") == 1; // Display.TYPE_INTERNAL
+                  } catch (Throwable t) {
+                      return true;
+                  }
+              }
+
+              private static void writeStatus(boolean force) {
+                  long now = System.currentTimeMillis();
+                  if (!force && now - lastWrite < 2000) return;
+                  lastWrite = now;
+                  try {
+                      String s = "hooked=" + (hooked ? 1 : 0) + "\n"
+                              + "boot_id=" + bootId + "\n"
+                              + "epoch=" + (now / 1000) + "\n"
+                              + "msg=" + message + "\n"
+                              + "events=" + events + "\n"
+                              + "last=" + last + "\n";
+                      FileOutputStream out = new FileOutputStream(STATUS_FILE, false);
+                      try {
+                          out.write(s.getBytes("UTF-8"));
+                      } finally {
+                          out.close();
+                      }
+                  } catch (Throwable ignored) {
+                      // status is best-effort only
+                  }
+              }
+
+              private static String firstLine(String path) {
+                  try {
+                      BufferedReader r = new BufferedReader(new FileReader(path));
+                      try {
+                          String l = r.readLine();
+                          return l == null ? "" : l.trim();
+                      } finally {
+                          r.close();
+                      }
+                  } catch (Throwable t) {
+                      return "";
+                  }
+              }
+          }
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/res/values/arrays.xml')"
+          cat > 'app/src/main/res/values/arrays.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string-array name="xposed_scope">
+                  <item>android</item>
+              </string-array>
+          </resources>
+          __EOF__
+          mkdir -p "$(dirname 'build.gradle')"
+          cat > 'build.gradle' <<'__EOF__'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          __EOF__
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'__EOF__'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          __EOF__
+          mkdir -p "$(dirname 'settings.gradle')"
+          cat > 'settings.gradle' <<'__EOF__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'CODMStretchHook'
+          include ':app', ':xposed-stub'
+          __EOF__
+          mkdir -p "$(dirname 'xposed-stub/build.gradle')"
+          cat > 'xposed-stub/build.gradle' <<'__EOF__'
+          plugins {
+              id 'java-library'
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_1_8
+              targetCompatibility = JavaVersion.VERSION_1_8
+          }
+          __EOF__
+          mkdir -p "$(dirname 'xposed-stub/src/main/java/de/robv/android/xposed/IXposedHookLoadPackage.java')"
+          cat > 'xposed-stub/src/main/java/de/robv/android/xposed/IXposedHookLoadPackage.java' <<'__EOF__'
+          package de.robv.android.xposed;
+
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+          public interface IXposedHookLoadPackage {
+              void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable;
+          }
+          __EOF__
+          mkdir -p "$(dirname 'xposed-stub/src/main/java/de/robv/android/xposed/XC_MethodHook.java')"
+          cat > 'xposed-stub/src/main/java/de/robv/android/xposed/XC_MethodHook.java' <<'__EOF__'
+          package de.robv.android.xposed;
+
+          import java.lang.reflect.Member;
+
+          public abstract class XC_MethodHook {
+              public XC_MethodHook() {
+              }
+
+              public XC_MethodHook(int priority) {
+              }
+
+              protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+              }
+
+              protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+              }
+
+              public static class MethodHookParam {
+                  public Member method;
+                  public Object thisObject;
+                  public Object[] args;
+
+                  public Object getResult() {
+                      return null;
+                  }
+
+                  public void setResult(Object result) {
+                  }
+              }
+
+              public class Unhook {
+                  public void unhook() {
+                  }
+              }
+          }
+          __EOF__
+          mkdir -p "$(dirname 'xposed-stub/src/main/java/de/robv/android/xposed/XposedBridge.java')"
+          cat > 'xposed-stub/src/main/java/de/robv/android/xposed/XposedBridge.java' <<'__EOF__'
+          package de.robv.android.xposed;
+
+          import java.util.Set;
+
+          public final class XposedBridge {
+              private XposedBridge() {
+              }
+
+              public static void log(String text) {
+              }
+
+              public static void log(Throwable t) {
+              }
+
+              public static Set<XC_MethodHook.Unhook> hookAllMethods(Class<?> hookClass, String methodName, XC_MethodHook callback) {
+                  return null;
+              }
+          }
+          __EOF__
+          mkdir -p "$(dirname 'xposed-stub/src/main/java/de/robv/android/xposed/XposedHelpers.java')"
+          cat > 'xposed-stub/src/main/java/de/robv/android/xposed/XposedHelpers.java' <<'__EOF__'
+          package de.robv.android.xposed;
+
+          public final class XposedHelpers {
+              private XposedHelpers() {
+              }
+
+              public static Class<?> findClassIfExists(String className, ClassLoader classLoader) {
+                  return null;
+              }
+
+              public static Object callMethod(Object obj, String methodName, Object... args) {
+                  return null;
+              }
+
+              public static int getIntField(Object obj, String fieldName) {
+                  return 0;
+              }
+          }
+          __EOF__
+          mkdir -p "$(dirname 'xposed-stub/src/main/java/de/robv/android/xposed/callbacks/XC_LoadPackage.java')"
+          cat > 'xposed-stub/src/main/java/de/robv/android/xposed/callbacks/XC_LoadPackage.java' <<'__EOF__'
+          package de.robv.android.xposed.callbacks;
+
+          public abstract class XC_LoadPackage {
+              public static final class LoadPackageParam {
+                  public String packageName;
+                  public String processName;
+                  public ClassLoader classLoader;
+                  public boolean isFirstApplication;
+              }
+          }
+          __EOF__
+      - name: Make sure Android SDK 34 is present
+        run: |
+          echo y | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" || true
+      - name: Build
+        run: gradle --no-daemon :app:assembleDebug
+      - name: Name the APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk CODM-Stretch-Hook.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CODM-Stretch-Hook
+          path: CODM-Stretch-Hook.apk
+      - name: Publish release (easy download link)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "build-${{ github.run_number }}" CODM-Stretch-Hook.apk --repo "$GITHUB_REPOSITORY" --title "CODM Stretch Hook build ${{ github.run_number }}" --notes "Install the APK, enable it in LSPosed with the System Framework scope, then reboot."
+          
